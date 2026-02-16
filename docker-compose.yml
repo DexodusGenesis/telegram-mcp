@@ -9,12 +9,32 @@ services:
     # Load environment variables from a .env file in the same directory
     env_file:
       - .env
-    # Keep stdin open and allocate a pseudo-TTY, crucial for stdio MCP servers
-    stdin_open: true
-    tty: true
+
+    # ===== HTTP Mode Configuration (Default) =====
+    # For HTTP mode, set MCP_TRANSPORT=http in .env file
+    # Expose port for HTTP server
+    ports:
+      - "8000:8000"
+
+    # ===== Stdio Mode Configuration =====
+    # For stdio mode, set MCP_TRANSPORT=stdio in .env file
+    # Uncomment the following lines for stdio mode:
+    # stdin_open: true
+    # tty: true
+    # Comment out the ports section above when using stdio mode
+
     # Optional: Uncomment the following lines to mount a local directory
     # for persisting the Telegram session file if NOT using TELEGRAM_SESSION_STRING.
     # Replace './telegram_sessions' with your desired host path.
     # volumes:
     #   - ./telegram_sessions:/app
+
+    # Health check (works in HTTP mode only)
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 5s
+
     restart: unless-stopped 

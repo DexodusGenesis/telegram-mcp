@@ -152,8 +152,10 @@ Additionally, GIF-related tools (`get_gif_search`, `get_saved_gifs`, `send_gif`)
 
 ## 📋 Requirements
 - Python 3.10+
-- [Telethon](https://docs.telethon.dev/)
-- [MCP Python SDK](https://modelcontextprotocol.io/docs/)
+- [Telethon](https://docs.telethon.dev/) - Telegram client library
+- [MCP Python SDK](https://modelcontextprotocol.io/docs/) - Model Context Protocol
+- [uvicorn](https://www.uvicorn.org/) - ASGI server (for HTTP mode)
+- [starlette](https://www.starlette.io/) - Web framework (for HTTP mode)
 - [Claude Desktop](https://claude.ai/desktop) or [Cursor](https://cursor.so/) (or any MCP client)
 
 ---
@@ -239,9 +241,187 @@ docker run -it --rm \
 
 ---
 
+## 🌐 HTTP Mode (Production Deployment)
+
+The MCP server supports two transport modes: **stdio** (default) and **HTTP**. HTTP mode is recommended for production deployments, allowing the server to run independently and be accessed by multiple clients.
+
+### Transport Mode Comparison
+
+| Feature | Stdio Mode | HTTP Mode |
+|---------|-----------|-----------|
+| **Use Case** | Local development, Claude Desktop | Production, remote access, cloud deployment |
+| **Server Lifecycle** | Managed by MCP client (subprocess) | Independent server process |
+| **Multiple Clients** | No (1:1 with client) | Yes (many-to-one) |
+| **Network Access** | Local only | Local or remote |
+| **Setup Complexity** | Simple | Moderate |
+| **Health Monitoring** | N/A | `/health` endpoint available |
+
+### Setting Up HTTP Mode
+
+#### 1. Configure Environment Variables
+
+Add to your `.env` file:
+
+```bash
+# Set transport mode to HTTP
+MCP_TRANSPORT=http
+
+# HTTP server configuration
+MCP_SERVER_HOST=0.0.0.0  # 0.0.0.0 for all interfaces, 127.0.0.1 for localhost only
+MCP_SERVER_PORT=3006
+```
+
+#### 2. Starting the HTTP Server
+
+**Local Development:**
+```bash
+# Using Python directly
+MCP_TRANSPORT=http python main.py
+
+# Using uv
+MCP_TRANSPORT=http uv run main.py
+```
+
+**Docker (Recommended for Production):**
+```bash
+# Using Docker Compose
+docker compose up -d
+
+# Or using docker run
+docker run -d -p 8000:8000 \
+  -e MCP_TRANSPORT=http \
+  -e TELEGRAM_API_ID="YOUR_API_ID" \
+  -e TELEGRAM_API_HASH="YOUR_API_HASH" \
+  -e TELEGRAM_SESSION_STRING="YOUR_SESSION_STRING" \
+  --name telegram-mcp \
+  telegram-mcp:latest
+```
+
+#### 3. Verify Server is Running
+
+```bash
+# Check health endpoint
+curl http://localhost:8000/health
+
+# Expected response:
+# {"status":"healthy","service":"telegram-mcp","telegram_connected":true}
+```
+
+#### 4. Production Deployment with Multiple Workers
+
+For high-traffic production environments, use uvicorn with multiple workers:
+
+```bash
+# Install uvicorn with standard extras
+pip install "uvicorn[standard]"
+
+# Run with multiple workers
+uvicorn main:app --host 0.0.0.0 --port 8000 --workers 4
+
+# Or with Gunicorn for better process management
+gunicorn main:app \
+  -k uvicorn.workers.UvicornWorker \
+  --bind 0.0.0.0:8000 \
+  --workers 4 \
+  --access-logfile - \
+  --error-logfile -
+```
+
+**Note:** When using multiple workers, be aware that each worker will maintain its own Telethon client connection. For most use cases, a single worker is sufficient.
+
+#### 5. Cloud Deployment Examples
+
+**AWS EC2/ECS:**
+```bash
+# Using Docker
+docker run -d -p 8000:8000 \
+  -e MCP_TRANSPORT=http \
+  -e TELEGRAM_API_ID="${TELEGRAM_API_ID}" \
+  -e TELEGRAM_API_HASH="${TELEGRAM_API_HASH}" \
+  -e TELEGRAM_SESSION_STRING="${TELEGRAM_SESSION_STRING}" \
+  --restart unless-stopped \
+  telegram-mcp:latest
+```
+
+**Google Cloud Run / Azure Container Instances:**
+- Set `MCP_TRANSPORT=http` in environment variables
+- Expose port 8000
+- Configure health check endpoint: `/health`
+- Set minimum instances to 1 (to maintain Telegram connection)
+
+**Kubernetes:**
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: telegram-mcp
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: telegram-mcp
+  template:
+    metadata:
+      labels:
+        app: telegram-mcp
+    spec:
+      containers:
+      - name: telegram-mcp
+        image: telegram-mcp:latest
+        ports:
+        - containerPort: 8000
+        env:
+        - name: MCP_TRANSPORT
+          value: "http"
+        - name: TELEGRAM_API_ID
+          valueFrom:
+            secretKeyRef:
+              name: telegram-secrets
+              key: api-id
+        - name: TELEGRAM_API_HASH
+          valueFrom:
+            secretKeyRef:
+              name: telegram-secrets
+              key: api-hash
+        - name: TELEGRAM_SESSION_STRING
+          valueFrom:
+            secretKeyRef:
+              name: telegram-secrets
+              key: session-string
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          initialDelaySeconds: 10
+          periodSeconds: 30
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          initialDelaySeconds: 5
+          periodSeconds: 10
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: telegram-mcp
+spec:
+  selector:
+    app: telegram-mcp
+  ports:
+  - port: 8000
+    targetPort: 8000
+  type: LoadBalancer
+```
+
+---
+
 ## ⚙️ Configuration for Claude & Cursor
 
-### MCP Configuration
+The telegram-mcp server supports two transport modes. Configure your MCP client based on your chosen mode.
+
+### Stdio Mode (Default - Local Development)
+
 Edit your Claude desktop config (e.g. `~/Library/Application Support/Claude/claude_desktop_config.json`) or Cursor config (`~/.cursor/mcp.json`):
 
 ```json
@@ -254,11 +434,56 @@ Edit your Claude desktop config (e.g. `~/Library/Application Support/Claude/clau
         "/full/path/to/telegram-mcp",
         "run",
         "main.py"
-      ]
+      ],
+      "env": {
+        "MCP_TRANSPORT": "stdio"
+      }
     }
   }
 }
 ```
+
+### HTTP Mode (Production - Local Server)
+
+For HTTP mode with a locally running server:
+
+```json
+{
+  "mcpServers": {
+    "telegram-mcp": {
+      "url": "http://localhost:8000/mcp",
+      "transport": "http"
+    }
+  }
+}
+```
+
+**Before using this configuration:**
+1. Start the server separately: `MCP_TRANSPORT=http python main.py` or `docker compose up`
+2. Verify server is running: `curl http://localhost:8000/health`
+3. Restart Claude Desktop or Cursor
+
+### HTTP Mode (Production - Remote Server)
+
+For HTTP mode with a remote/cloud-hosted server:
+
+```json
+{
+  "mcpServers": {
+    "telegram-mcp": {
+      "url": "https://your-server.com/mcp",
+      "transport": "http"
+    }
+  }
+}
+```
+
+**Security Recommendations for Remote Deployment:**
+- Use HTTPS with valid SSL certificates
+- Implement authentication/API keys (add reverse proxy with auth)
+- Use a firewall to restrict access
+- Consider using a VPN for additional security
+- Rotate your `TELEGRAM_SESSION_STRING` regularly
 
 ## 📝 Tool Examples with Code & Output
 

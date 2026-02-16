@@ -4208,10 +4208,57 @@ async def reorder_folders(folder_ids: List[int]) -> str:
         )
 
 
+# ==================== ASGI Application Setup for HTTP Mode ====================
+# Create ASGI app for HTTP/production deployment using Streamable HTTP transport
+app = mcp.streamable_http_app()
+
+
+@app.on_event("startup")
+async def startup():
+    """Initialize Telethon client on server startup (HTTP mode only)."""
+    try:
+        print("Starting Telegram client (HTTP mode)...")
+        await client.start()
+        print("Telegram client started successfully")
+    except Exception as e:
+        print(f"Error starting Telegram client: {e}", file=sys.stderr)
+        if isinstance(e, sqlite3.OperationalError) and "database is locked" in str(e):
+            print(
+                "Database lock detected. Please ensure no other instances are running.",
+                file=sys.stderr,
+            )
+        raise
+
+
+@app.on_event("shutdown")
+async def shutdown():
+    """Cleanup Telethon client on server shutdown (HTTP mode only)."""
+    try:
+        print("Disconnecting Telegram client...")
+        await client.disconnect()
+        print("Telegram client disconnected")
+    except Exception as e:
+        print(f"Error during shutdown: {e}", file=sys.stderr)
+
+
+# Optional: Add health check endpoint for production monitoring
+@app.route("/health", methods=["GET"])
+async def health_check(request):
+    """Health check endpoint for monitoring."""
+    from starlette.responses import JSONResponse
+    return JSONResponse({
+        "status": "healthy",
+        "service": "telegram-mcp",
+        "telegram_connected": client.is_connected()
+    })
+
+
+# ==================== Stdio Mode Entry Point ====================
 async def _main() -> None:
+    """Entry point for stdio mode (backward compatibility)."""
     try:
         # Start the Telethon client non-interactively
-        print("Starting Telegram client...")
+        print("Starting Telegram client (stdio mode)...")
         await client.start()
 
         print("Telegram client started. Running MCP server...")
@@ -4227,9 +4274,47 @@ async def _main() -> None:
         sys.exit(1)
 
 
+# ==================== Main Entry Point with Transport Mode Switching ====================
 def main() -> None:
-    nest_asyncio.apply()
-    asyncio.run(_main())
+    """
+    Main entry point supporting both stdio and HTTP transport modes.
+
+    Transport mode is controlled by the MCP_TRANSPORT environment variable:
+    - 'stdio' (default): Traditional stdio-based MCP server for Claude Desktop/Cursor
+    - 'http': HTTP/ASGI server for production deployment
+
+    HTTP mode configuration:
+    - MCP_SERVER_HOST: Host to bind to (default: 0.0.0.0)
+    - MCP_SERVER_PORT: Port to listen on (default: 3006)
+    """
+    transport = os.getenv("MCP_TRANSPORT", "stdio").lower()
+
+    if transport == "http":
+        # HTTP mode: Run ASGI app with uvicorn
+        import uvicorn
+
+        host = os.getenv("MCP_SERVER_HOST", "0.0.0.0")
+        port = int(os.getenv("MCP_SERVER_PORT", "3006"))
+
+        print(f"Starting MCP server in HTTP mode on {host}:{port}")
+        print(f"Health check available at: http://{host}:{port}/health")
+        print(f"MCP endpoint available at: http://{host}:{port}/mcp")
+
+        # Run uvicorn server with production settings
+        uvicorn.run(
+            "main:app",
+            host=host,
+            port=port,
+            log_level="info",
+            # For production with multiple workers, use:
+            # workers=4,  # or multiprocessing.cpu_count()
+            # But note: Telethon client needs to be handled per-worker
+        )
+    else:
+        # Stdio mode (default): Traditional MCP server
+        print("Starting MCP server in stdio mode")
+        nest_asyncio.apply()
+        asyncio.run(_main())
 
 
 if __name__ == "__main__":

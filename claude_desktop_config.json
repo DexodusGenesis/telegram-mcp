@@ -1,13 +1,33 @@
 {
     "mcpServers": {
-        "telegram-mcp": {
+        "telegram-mcp-stdio": {
+            "comment": "Stdio mode (default) - Server runs as subprocess",
             "command": "/PATH-TO/uv",
             "args": [
                 "--directory",
                 "/PATH-TO/telegram-mcp",
                 "run",
                 "main.py"
-            ]
+            ],
+            "env": {
+                "MCP_TRANSPORT": "stdio"
+            }
+        },
+        "telegram-mcp-http": {
+            "comment": "HTTP mode - Server runs independently, Claude connects via HTTP",
+            "url": "http://localhost:8000/mcp",
+            "transport": "http"
+        },
+        "telegram-mcp-http-remote": {
+            "comment": "HTTP mode (remote server) - For production deployment",
+            "url": "https://your-server.com/mcp",
+            "transport": "http"
         }
+    },
+    "_instructions": {
+        "stdio_mode": "Use 'telegram-mcp-stdio' for local development. The server runs as a subprocess managed by Claude Desktop.",
+        "http_mode_local": "Use 'telegram-mcp-http' for local HTTP mode. Start the server separately with 'MCP_TRANSPORT=http python main.py' or 'docker-compose up'.",
+        "http_mode_remote": "Use 'telegram-mcp-http-remote' for production. Deploy the server to a cloud provider and update the URL accordingly.",
+        "note": "Only enable ONE telegram-mcp configuration at a time by commenting out the others or removing unused entries."
     }
 }

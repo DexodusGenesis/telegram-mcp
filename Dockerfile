@@ -40,8 +40,19 @@ ENV TELEGRAM_SESSION_NAME="telegram_mcp_session"
 # Or provide the session string directly
 ENV TELEGRAM_SESSION_STRING=""
 
-# Expose any ports if the application were a web server (not needed for stdio MCP)
-# EXPOSE 8000
+# MCP Server transport mode (stdio or http)
+ENV MCP_TRANSPORT="stdio"
+# HTTP server configuration (used when MCP_TRANSPORT=http)
+ENV MCP_SERVER_HOST="0.0.0.0"
+ENV MCP_SERVER_PORT="3006"
+
+# Expose port for HTTP mode (used when MCP_TRANSPORT=http)
+EXPOSE 8000
+
+# Health check for HTTP mode (only works when MCP_TRANSPORT=http)
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+    CMD wget --no-verbose --tries=1 --spider http://localhost:8000/health || exit 1
 
 # Define the command to run the application
+# The application will automatically select stdio or HTTP mode based on MCP_TRANSPORT
 CMD ["python", "main.py"] 
