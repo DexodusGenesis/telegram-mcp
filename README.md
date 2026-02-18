@@ -9,28 +9,25 @@
 
 ---
 
-## 🤖 MCP in Action
-
-Here's a demonstration of the Telegram MCP capabilities in [Claude](https://docs.anthropic.com/en/docs/agents-and-tools/mcp):
-
- **Basic usage example:**
-
-![Telegram MCP in action](screenshots/1.png)
-
-1. **Example: Asking Claude to analyze chat history and send a response:**
-
-![Telegram MCP Request](screenshots/2.png)
-
-2. **Successfully sent message to the group:**
-
-![Telegram MCP Result](screenshots/3.png)
-
-As you can see, the AI can seamlessly interact with your Telegram account, retrieving and displaying your chats, messages, and other data in a natural way.
-
----
 
 A full-featured Telegram integration for Claude, Cursor, and any MCP-compatible client, powered by [Telethon](https://docs.telethon.dev/) and the [Model Context Protocol (MCP)](https://modelcontextprotocol.io/). This project lets you interact with your Telegram account programmatically, automating everything from messaging to group management.
 
+
+---
+
+## TL;DR
+
+How to run this locally:
+
+```bash
+cd telegram-mcp
+uv sync
+uv run session_string_generator.py  # one-time: generates your session string (SKIP if you already have a SESSION_STRING in the .env)
+cp .env.example .env                # fill in API_ID, API_HASH, SESSION_STRING
+uv run main.py                      # starts the MCP server (stdio mode)
+```
+
+> RECOMMENDED, for HTTP mode use this .env variable: `MCP_TRANSPORT=http`
 
 ---
 
@@ -253,8 +250,6 @@ The MCP server supports two transport modes: **stdio** (default) and **HTTP**. H
 | **Server Lifecycle** | Managed by MCP client (subprocess) | Independent server process |
 | **Multiple Clients** | No (1:1 with client) | Yes (many-to-one) |
 | **Network Access** | Local only | Local or remote |
-| **Setup Complexity** | Simple | Moderate |
-| **Health Monitoring** | N/A | `/health` endpoint available |
 
 ### Setting Up HTTP Mode
 
@@ -329,154 +324,8 @@ gunicorn main:app \
 
 **Note:** When using multiple workers, be aware that each worker will maintain its own Telethon client connection. For most use cases, a single worker is sufficient.
 
-#### 5. Cloud Deployment Examples
-
-**AWS EC2/ECS:**
-```bash
-# Using Docker
-docker run -d -p 8000:8000 \
-  -e MCP_TRANSPORT=http \
-  -e TELEGRAM_API_ID="${TELEGRAM_API_ID}" \
-  -e TELEGRAM_API_HASH="${TELEGRAM_API_HASH}" \
-  -e TELEGRAM_SESSION_STRING="${TELEGRAM_SESSION_STRING}" \
-  --restart unless-stopped \
-  telegram-mcp:latest
-```
-
-**Google Cloud Run / Azure Container Instances:**
-- Set `MCP_TRANSPORT=http` in environment variables
-- Expose port 8000
-- Configure health check endpoint: `/health`
-- Set minimum instances to 1 (to maintain Telegram connection)
-
-**Kubernetes:**
-```yaml
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: telegram-mcp
-spec:
-  replicas: 1
-  selector:
-    matchLabels:
-      app: telegram-mcp
-  template:
-    metadata:
-      labels:
-        app: telegram-mcp
-    spec:
-      containers:
-      - name: telegram-mcp
-        image: telegram-mcp:latest
-        ports:
-        - containerPort: 8000
-        env:
-        - name: MCP_TRANSPORT
-          value: "http"
-        - name: TELEGRAM_API_ID
-          valueFrom:
-            secretKeyRef:
-              name: telegram-secrets
-              key: api-id
-        - name: TELEGRAM_API_HASH
-          valueFrom:
-            secretKeyRef:
-              name: telegram-secrets
-              key: api-hash
-        - name: TELEGRAM_SESSION_STRING
-          valueFrom:
-            secretKeyRef:
-              name: telegram-secrets
-              key: session-string
-        livenessProbe:
-          httpGet:
-            path: /health
-            port: 8000
-          initialDelaySeconds: 10
-          periodSeconds: 30
-        readinessProbe:
-          httpGet:
-            path: /health
-            port: 8000
-          initialDelaySeconds: 5
-          periodSeconds: 10
----
-apiVersion: v1
-kind: Service
-metadata:
-  name: telegram-mcp
-spec:
-  selector:
-    app: telegram-mcp
-  ports:
-  - port: 8000
-    targetPort: 8000
-  type: LoadBalancer
-```
 
 ---
-
-## ⚙️ Configuration for Claude & Cursor
-
-The telegram-mcp server supports two transport modes. Configure your MCP client based on your chosen mode.
-
-### Stdio Mode (Default - Local Development)
-
-Edit your Claude desktop config (e.g. `~/Library/Application Support/Claude/claude_desktop_config.json`) or Cursor config (`~/.cursor/mcp.json`):
-
-```json
-{
-  "mcpServers": {
-    "telegram-mcp": {
-      "command": "uv",
-      "args": [
-        "--directory",
-        "/full/path/to/telegram-mcp",
-        "run",
-        "main.py"
-      ],
-      "env": {
-        "MCP_TRANSPORT": "stdio"
-      }
-    }
-  }
-}
-```
-
-### HTTP Mode (Production - Local Server)
-
-For HTTP mode with a locally running server:
-
-```json
-{
-  "mcpServers": {
-    "telegram-mcp": {
-      "url": "http://localhost:8000/mcp",
-      "transport": "http"
-    }
-  }
-}
-```
-
-**Before using this configuration:**
-1. Start the server separately: `MCP_TRANSPORT=http python main.py` or `docker compose up`
-2. Verify server is running: `curl http://localhost:8000/health`
-3. Restart Claude Desktop or Cursor
-
-### HTTP Mode (Production - Remote Server)
-
-For HTTP mode with a remote/cloud-hosted server:
-
-```json
-{
-  "mcpServers": {
-    "telegram-mcp": {
-      "url": "https://your-server.com/mcp",
-      "transport": "http"
-    }
-  }
-}
-```
 
 **Security Recommendations for Remote Deployment:**
 - Use HTTPS with valid SSL certificates
@@ -821,23 +670,6 @@ Chat ID: 123456789, Contact: John Smith, Username: @johnsmith, Unread: 3
 
 ---
 
-## 🎮 Usage Examples
-
-- "Show my recent chats"
-- "Send 'Hello world' to chat 123456789"
-- "Add contact with phone +1234567890, name John Doe"
-- "Create a group 'Project Team' with users 111, 222, 333"
-- "Download the media from message 42 in chat 123456789"
-- "Mute notifications for chat 123456789"
-- "Promote user 111 to admin in group 123456789"
-- "Search for public channels about 'news'"
-- "Join the Telegram group with invite link https://t.me/+AbCdEfGhIjK"
-- "Send a sticker to my Saved Messages"
-- "Get all my sticker sets"
-
-You can use these tools via natural language in Claude, Cursor, or any MCP-compatible client.
-
----
 
 ## 🧠 Error Handling & Robustness
 
@@ -852,22 +684,6 @@ This implementation includes comprehensive error handling:
 
 The code is designed to be robust against common Telegram API issues and limitations.
 
----
-
-## 🛠️ Contribution Guide
-
-1. **Fork this repo:** [chigwell/telegram-mcp](https://github.com/chigwell/telegram-mcp)
-2. **Clone your fork:**
-   ```bash
-   git clone https://github.com/<your-github-username>/telegram-mcp.git
-   ```
-3. **Create a new branch:**
-   ```bash
-   git checkout -b my-feature
-   ```
-4. **Make your changes, add tests/docs if needed.**
-5. **Push and open a Pull Request** to [chigwell/telegram-mcp](https://github.com/chigwell/telegram-mcp) with a clear description.
-6. **Tag @chigwell or @l1v0n1** in your PR for review.
 
 ---
 
@@ -905,9 +721,3 @@ This project is licensed under the [Apache 2.0 License](LICENSE).
 - [chigwell/telegram-mcp](https://github.com/chigwell/telegram-mcp) (upstream)
 
 ---
-
-**Maintained by [@chigwell](https://github.com/chigwell) and [@l1v0n1](https://github.com/l1v0n1). PRs welcome!**
-
-## Star History
-
-[![Star History Chart](https://api.star-history.com/svg?repos=chigwell/telegram-mcp&type=Date)](https://www.star-history.com/#chigwell/telegram-mcp&Date)
