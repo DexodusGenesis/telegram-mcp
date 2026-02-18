@@ -4210,47 +4210,76 @@ async def reorder_folders(folder_ids: List[int]) -> str:
 
 # ==================== ASGI Application Setup for HTTP Mode ====================
 # Create ASGI app for HTTP/production deployment using Streamable HTTP transport
-app = mcp.streamable_http_app()
+#
+# We use a pure-ASGI lifespan wrapper instead of Starlette's on_event/Mount
+# because:
+#   1. @app.on_event("startup") is silently ignored when streamable_http_app()
+#      already has an internal lifespan (Starlette 0.20+).
+#   2. Mount("/", app=_mcp_app) strips the leading "/" from paths, breaking
+#      the MCP server's internal routing (/mcp becomes mcp).
+#
+# The wrapper intercepts only the "lifespan" ASGI scope; all HTTP scopes are
+# forwarded to the inner app unchanged.
+
+_mcp_app = mcp.streamable_http_app()
 
 
-@app.on_event("startup")
-async def startup():
-    """Initialize Telethon client on server startup (HTTP mode only)."""
-    try:
-        print("Starting Telegram client (HTTP mode)...")
-        await client.start()
-        print("Telegram client started successfully")
-    except Exception as e:
-        print(f"Error starting Telegram client: {e}", file=sys.stderr)
-        if isinstance(e, sqlite3.OperationalError) and "database is locked" in str(e):
-            print(
-                "Database lock detected. Please ensure no other instances are running.",
-                file=sys.stderr,
-            )
-        raise
+class _TelethonLifespan:
+    """
+    Pure-ASGI wrapper that connects/disconnects the Telethon client at
+    lifespan startup/shutdown without touching HTTP routing.
+
+    All http/websocket scopes are forwarded to the inner MCP app unchanged,
+    so path handling is completely unaffected.
+    """
+
+    __slots__ = ("_inner",)
+
+    def __init__(self, inner):
+        self._inner = inner
+
+    async def __call__(self, scope, receive, send):
+        # Non-lifespan scopes → pass through directly, no path manipulation
+        if scope["type"] != "lifespan":
+            await self._inner(scope, receive, send)
+            return
+
+        _connected = False
+
+        async def _receive():
+            nonlocal _connected
+            msg = await receive()
+            if msg["type"] == "lifespan.startup":
+                try:
+                    print("Starting Telegram client (HTTP mode)...")
+                    await client.start()
+                    print("Telegram client started successfully")
+                    _connected = True
+                except Exception as e:
+                    print(f"Error starting Telegram client: {e}", file=sys.stderr)
+                    if isinstance(e, sqlite3.OperationalError) and "database is locked" in str(e):
+                        print(
+                            "Database lock detected. Please ensure no other instances are running.",
+                            file=sys.stderr,
+                        )
+                    raise
+            return msg
+
+        async def _send(msg):
+            # Disconnect Telethon just before signalling shutdown complete
+            if msg["type"] == "lifespan.shutdown.complete" and _connected:
+                try:
+                    print("Disconnecting Telegram client...")
+                    await client.disconnect()
+                    print("Telegram client disconnected")
+                except Exception as e:
+                    print(f"Error during shutdown: {e}", file=sys.stderr)
+            await send(msg)
+
+        await self._inner(scope, _receive, _send)
 
 
-@app.on_event("shutdown")
-async def shutdown():
-    """Cleanup Telethon client on server shutdown (HTTP mode only)."""
-    try:
-        print("Disconnecting Telegram client...")
-        await client.disconnect()
-        print("Telegram client disconnected")
-    except Exception as e:
-        print(f"Error during shutdown: {e}", file=sys.stderr)
-
-
-# Optional: Add health check endpoint for production monitoring
-@app.route("/health", methods=["GET"])
-async def health_check(request):
-    """Health check endpoint for monitoring."""
-    from starlette.responses import JSONResponse
-    return JSONResponse({
-        "status": "healthy",
-        "service": "telegram-mcp",
-        "telegram_connected": client.is_connected()
-    })
+app = _TelethonLifespan(_mcp_app)
 
 
 # ==================== Stdio Mode Entry Point ====================
