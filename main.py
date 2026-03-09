@@ -91,7 +91,17 @@ TELEGRAM_SESSION_NAME = os.getenv("TELEGRAM_SESSION_NAME")
 # Check if a string session exists in environment, otherwise use file-based session
 SESSION_STRING = os.getenv("TELEGRAM_SESSION_STRING")
 
-mcp = FastMCP("telegram")
+from mcp.server.transport_security import TransportSecuritySettings
+
+# Allow Cloud Map DNS hostname for ECS inter-service communication
+_allowed_hosts = os.getenv("MCP_ALLOWED_HOSTS", "localhost,127.0.0.1").split(",")
+mcp = FastMCP(
+    "telegram",
+    transport_security=TransportSecuritySettings(
+        enable_dns_rebinding_protection=True,
+        allowed_hosts=[h.strip() + ":*" for h in _allowed_hosts],
+    ),
+)
 
 if SESSION_STRING:
     # Use the string session if available
