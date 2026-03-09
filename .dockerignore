@@ -1,0 +1,16 @@
+.env
+.env.*
+.git
+.github
+.venv
+__pycache__
+*.egg-info
+*.log
+*.md
+*.lock
+screenshots
+test_*
+session_string_generator.py
+claude_desktop_config.json
+docker-compose.yml
+.DS_Store

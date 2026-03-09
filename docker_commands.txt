@@ -1,0 +1,25 @@
+# ============================================================
+# Kassai Telegram-MCP — Docker Build & Push Commands
+# ============================================================
+#
+# IMPORTANT: No .env file is baked into the image (.dockerignore).
+# Only actual secrets need to be in AWS Secrets Manager.
+#
+# Secrets needed in Secrets Manager (kassai/telegram-mcp):
+#   TELEGRAM_API_ID, TELEGRAM_API_HASH, TELEGRAM_SESSION_STRING
+#
+# No code defaults were changed — Dockerfile already sets:
+#   MCP_TRANSPORT=http, MCP_SERVER_HOST=0.0.0.0, MCP_SERVER_PORT=3006
+# ============================================================
+
+# --- 1. Authenticate with ECR ---
+aws ecr get-login-password --region eu-central-1 | docker login --username AWS --password-stdin 637423427839.dkr.ecr.eu-central-1.amazonaws.com
+
+# --- 2. Build image (linux/amd64 for Fargate) ---
+docker build --platform linux/amd64 -t 637423427839.dkr.ecr.eu-central-1.amazonaws.com/kassai/telegram-mcp:1.0.0 .
+
+# --- 3. Push to ECR ---
+docker push 637423427839.dkr.ecr.eu-central-1.amazonaws.com/kassai/telegram-mcp:1.0.0
+
+# --- 4. Verify ---
+aws ecr describe-images --repository-name kassai/telegram-mcp --region eu-central-1 --query 'imageDetails[*].{Tags:imageTags,Size:imageSizeInBytes,Pushed:imagePushedAt}' --output table
