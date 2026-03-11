@@ -94,6 +94,15 @@ TELEGRAM_SESSION_NAME = os.getenv("TELEGRAM_SESSION_NAME")
 # Check if a string session exists in environment, otherwise use file-based session
 SESSION_STRING = os.getenv("TELEGRAM_SESSION_STRING")
 
+# Device fingerprint — prevents Telethon default "PC 64bit" from triggering bot detection
+_DEVICE_PARAMS = dict(
+    device_model=os.getenv("TELEGRAM_DEVICE_MODEL", "Pixel 8 Pro"),
+    system_version=os.getenv("TELEGRAM_SYSTEM_VERSION", "14"),
+    app_version=os.getenv("TELEGRAM_APP_VERSION", "10.3.1"),
+    lang_code=os.getenv("TELEGRAM_LANG_CODE", "en"),
+    system_lang_code=os.getenv("TELEGRAM_SYSTEM_LANG_CODE", "en-GB"),
+)
+
 from mcp.server.transport_security import TransportSecuritySettings
 
 # Allow Cloud Map DNS hostname for ECS inter-service communication
@@ -108,10 +117,10 @@ mcp = FastMCP(
 
 if SESSION_STRING:
     # Use the string session if available
-    client = TelegramClient(StringSession(SESSION_STRING), TELEGRAM_API_ID, TELEGRAM_API_HASH)
+    client = TelegramClient(StringSession(SESSION_STRING), TELEGRAM_API_ID, TELEGRAM_API_HASH, **_DEVICE_PARAMS)
 else:
     # Use file-based session
-    client = TelegramClient(TELEGRAM_SESSION_NAME, TELEGRAM_API_ID, TELEGRAM_API_HASH)
+    client = TelegramClient(TELEGRAM_SESSION_NAME, TELEGRAM_API_ID, TELEGRAM_API_HASH, **_DEVICE_PARAMS)
 
 # Setup robust logging with both file and console output
 logger = logging.getLogger("telegram_mcp")

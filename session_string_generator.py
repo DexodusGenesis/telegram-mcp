@@ -55,9 +55,17 @@ def main() -> None:
         "\nYour credentials will NOT be stored on any server and are only used for local authentication.\n"
     )
 
+    device_params = dict(
+        device_model=os.getenv("TELEGRAM_DEVICE_MODEL", "Pixel 8 Pro"),
+        system_version=os.getenv("TELEGRAM_SYSTEM_VERSION", "14"),
+        app_version=os.getenv("TELEGRAM_APP_VERSION", "10.3.1"),
+        lang_code=os.getenv("TELEGRAM_LANG_CODE", "en"),
+        system_lang_code=os.getenv("TELEGRAM_SYSTEM_LANG_CODE", "en-GB"),
+    )
+
     try:
         # Connect to Telegram and generate the session string
-        with TelegramClient(StringSession(), API_ID, API_HASH) as client:
+        with TelegramClient(StringSession(), API_ID, API_HASH, **device_params) as client:
             # The client.session.save() function from StringSession returns the session string
             session_string = StringSession.save(client.session)
 
