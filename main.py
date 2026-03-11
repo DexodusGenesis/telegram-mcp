@@ -1,14 +1,17 @@
-import os
-import sys
-import json
-import time
 import asyncio
-import sqlite3
+import heapq
+import json
 import logging
 import mimetypes
-from datetime import datetime, timedelta
+import os
+import random
+import sqlite3
+import sys
+import time
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
 from enum import Enum
-from typing import List, Dict, Optional, Union, Any
+from typing import Any, Dict, List, Optional, Union
 
 # Third-party libraries
 import nest_asyncio
@@ -147,6 +150,272 @@ except Exception as log_error:
     # Fallback to console-only logging
     logger.addHandler(console_handler)
     logger.error(f"Failed to set up log file handler: {log_error}")
+
+
+# ==================== Human-clock delivery queue (anti-ban) ====================
+# In-memory async queues + optional JSON persistence for delayed messages.
+# Worker runs read-receipt delay → thinking → typing loop → send.
+#
+# IMPORTANT: Run telegram-mcp as a long-lived process (systemd/supervisor or
+# MCP_TRANSPORT=http) so the delivery_worker and delayed_promoter tasks stay
+# alive. Do not invoke main.py per cron tick; the AI-service cron calls
+# submit_telegram_reply (MCP tool) which enqueues to this process.
+
+@dataclass
+class QueuedMessage:
+    """One message pending human-like delivery (active or delayed)."""
+    chat_id: Union[int, str]
+    session_id: str
+    llm_reply: str
+    user_tz: str
+    batch_key: str
+    created_at: str  # ISO
+    planned_eta_utc: str  # ISO
+    original_user_messages: List[str] = field(default_factory=list)
+    reply_to_message_id: Optional[int] = None
+    agent_id: Optional[str] = None
+    retry_count: int = 0
+
+    def to_persistable(self) -> Dict[str, Any]:
+        return {
+            "chat_id": self.chat_id,
+            "session_id": self.session_id,
+            "llm_reply": self.llm_reply,
+            "user_tz": self.user_tz,
+            "batch_key": self.batch_key,
+            "created_at": self.created_at,
+            "planned_eta_utc": self.planned_eta_utc,
+            "original_user_messages": self.original_user_messages,
+            "reply_to_message_id": self.reply_to_message_id,
+            "agent_id": self.agent_id,
+        }
+
+
+_active_queue: Optional[asyncio.Queue] = None
+_delayed_heap: List[tuple] = []  # (planned_eta_utc_dt, id, QueuedMessage)
+_delayed_heap_lock: asyncio.Lock = asyncio.Lock()
+_delayed_counter = 0
+_DELAYED_QUEUE_JSON = "delayed_queue.json"
+_MAX_SEND_RETRIES = 3
+
+
+def _delayed_store_path() -> str:
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), _DELAYED_QUEUE_JSON)
+
+
+def _load_delayed_queue() -> List[Dict[str, Any]]:
+    path = _delayed_store_path()
+    if not os.path.isfile(path):
+        return []
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, list) else []
+    except Exception as e:
+        logger.warning("delayed_queue load failed: %s", e)
+        return []
+
+
+def _save_delayed_queue(items: List[Dict[str, Any]]) -> None:
+    path = _delayed_store_path()
+    tmp = path + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(items, f, indent=0, ensure_ascii=False)
+        os.replace(tmp, path)
+    except Exception as e:
+        logger.warning("delayed_queue save failed: %s", e)
+        if os.path.isfile(tmp):
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+
+
+async def _delivery_worker() -> None:
+    """Consume active_queue: read delay → thinking → typing loop → send. Uses global client."""
+    global _active_queue
+    if _active_queue is None:
+        return
+    while True:
+        try:
+            msg = await _active_queue.get()
+        except asyncio.CancelledError:
+            break
+        try:
+            entity = await client.get_entity(msg.chat_id)
+            # Step 1: Read receipt delay (1–3 s) then mark read
+            delay_read = random.randint(1, 3)
+            await asyncio.sleep(delay_read)
+            try:
+                await client.send_read_acknowledge(entity)
+            except Exception as e:
+                logger.debug("send_read_acknowledge: %s", e)
+            # Step 2: Thinking phase (2–5 s)
+            think_time = random.uniform(2.0, 5.0)
+            await asyncio.sleep(think_time)
+            # Step 3: Typing loop (cap 20 s, refresh every 4.5 s)
+            base_typing = len(msg.llm_reply) * 0.1
+            typing_jitter = random.uniform(1.0, 3.0)
+            typing_total = min(base_typing + typing_jitter, 20.0)
+            while typing_total > 0:
+                try:
+                    await client(functions.messages.SetTypingRequest(
+                        peer=entity,
+                        action=types.SendMessageTypingAction(),
+                    ))
+                except Exception as e:
+                    logger.debug("SetTypingRequest: %s", e)
+                chunk = min(4.5, typing_total)
+                await asyncio.sleep(chunk)
+                typing_total -= chunk
+            # Step 4: Dispatch
+            reply_to = msg.reply_to_message_id
+            try:
+                if reply_to is not None:
+                    await client.send_message(entity, msg.llm_reply, reply_to=reply_to)
+                else:
+                    await client.send_message(entity, msg.llm_reply)
+            except Exception as e:
+                if msg.retry_count < _MAX_SEND_RETRIES and (
+                    "flood" in str(e).lower() or "503" in str(e) or "502" in str(e) or "timed out" in str(e).lower()
+                ):
+                    msg.retry_count += 1
+                    await _active_queue.put(msg)
+                    logger.warning("delivery_worker send retry %s: %s", msg.retry_count, e)
+                else:
+                    logger.error("delivery_worker send failed: %s", e)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.error("delivery_worker task error: %s", e)
+        finally:
+            try:
+                _active_queue.task_done()
+            except ValueError:
+                pass
+
+
+async def _delayed_promoter() -> None:
+    """Move due items from delayed heap to active queue; run morning batching (single reply per batch)."""
+    global _active_queue, _delayed_heap
+    if _active_queue is None:
+        return
+    while True:
+        try:
+            await asyncio.sleep(1.0)
+            now_utc = datetime.now(timezone.utc)
+            async with _delayed_heap_lock:
+                due: List[tuple] = []
+                while _delayed_heap and _delayed_heap[0][0] <= now_utc + timedelta(minutes=2):
+                    due.append(heapq.heappop(_delayed_heap))
+                if due:
+                    _persist_delayed_heap()
+            if not due:
+                continue
+            # Group by batch_key for morning batching
+            by_batch: Dict[str, List[QueuedMessage]] = {}
+            for _, _, qm in due:
+                by_batch.setdefault(qm.batch_key, []).append(qm)
+            for batch_key, group in by_batch.items():
+                if len(group) == 1:
+                    await _active_queue.put(group[0])
+                else:
+                    first = group[0]
+                    all_orig: List[str] = list(first.original_user_messages)
+                    for g in group[1:]:
+                        if g.original_user_messages:
+                            all_orig.extend(g.original_user_messages)
+                    combined_reply = first.llm_reply
+                    ai_url = os.getenv("AI_SERVICE_URL", "").strip()
+                    if ai_url and all_orig:
+                        try:
+                            import httpx
+                            async with httpx.AsyncClient(timeout=60.0) as h:
+                                r = await h.post(
+                                    f"{ai_url.rstrip('/')}/api/v1/alex/internal/telegram-morning-batch",
+                                    json={
+                                        "session_id": first.session_id,
+                                        "chat_id": str(first.chat_id),
+                                        "original_user_messages": all_orig,
+                                        "agent_id": first.agent_id,
+                                    },
+                                )
+                                if r.status_code == 200:
+                                    data = r.json()
+                                    combined_reply = (data.get("reply") or "").strip() or combined_reply
+                        except Exception as e:
+                            logger.warning("morning-batch AI call failed: %s, using first reply", e)
+                    one = QueuedMessage(
+                        chat_id=first.chat_id,
+                        session_id=first.session_id,
+                        llm_reply=combined_reply,
+                        user_tz=first.user_tz,
+                        batch_key=first.batch_key,
+                        created_at=first.created_at,
+                        planned_eta_utc=first.planned_eta_utc,
+                        original_user_messages=all_orig,
+                        reply_to_message_id=first.reply_to_message_id,
+                        agent_id=first.agent_id,
+                    )
+                    await _active_queue.put(one)
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            logger.error("delayed_promoter error: %s", e)
+
+
+def _persist_delayed_heap() -> None:
+    items = [qm.to_persistable() for _, _, qm in _delayed_heap]
+    _save_delayed_queue(items)
+
+
+def _restore_delayed_heap() -> None:
+    global _delayed_heap
+    raw = _load_delayed_queue()
+    now_utc = datetime.now(timezone.utc)
+    for item in raw:
+        eta_str = item.get("planned_eta_utc")
+        if not eta_str:
+            continue
+        try:
+            eta_dt = datetime.fromisoformat(eta_str.replace("Z", "+00:00"))
+            if eta_dt.tzinfo is None:
+                eta_dt = eta_dt.replace(tzinfo=timezone.utc)
+        except Exception:
+            eta_dt = now_utc + timedelta(seconds=random.uniform(5, 60))
+        if eta_dt < now_utc:
+            eta_dt = now_utc + timedelta(seconds=random.uniform(5, 120))
+        qm = QueuedMessage(
+            chat_id=item["chat_id"],
+            session_id=item.get("session_id", ""),
+            llm_reply=item.get("llm_reply", ""),
+            user_tz=item.get("user_tz", "UTC"),
+            batch_key=item.get("batch_key", ""),
+            created_at=item.get("created_at", now_utc.isoformat()),
+            planned_eta_utc=eta_dt.isoformat(),
+            original_user_messages=item.get("original_user_messages", []),
+            reply_to_message_id=item.get("reply_to_message_id"),
+            agent_id=item.get("agent_id"),
+        )
+        global _delayed_counter
+        _delayed_counter += 1
+        heapq.heappush(_delayed_heap, (eta_dt, _delayed_counter, qm))
+
+
+_delivery_worker_task: Optional[asyncio.Task] = None
+_scheduler_task: Optional[asyncio.Task] = None
+
+
+def start_delivery_background_tasks() -> None:
+    """Start delivery worker and delayed promoter. Call after client.start()."""
+    global _active_queue, _delayed_heap, _delivery_worker_task, _scheduler_task
+    if _active_queue is None:
+        _active_queue = asyncio.Queue()
+    _restore_delayed_heap()
+    _delivery_worker_task = asyncio.create_task(_delivery_worker())
+    _scheduler_task = asyncio.create_task(_delayed_promoter())
+    logger.info("delivery background tasks started")
 
 
 # Error code prefix mapping for better error tracing
@@ -2766,6 +3035,75 @@ async def mark_as_read(chat_id: Union[int, str]) -> str:
 
 
 @mcp.tool(
+    annotations=ToolAnnotations(
+        title="Submit Telegram Reply (Human-Clock Queue)",
+        openWorldHint=True,
+        destructiveHint=True,
+    )
+)
+@validate_id("chat_id")
+async def submit_telegram_reply(
+    chat_id: Union[int, str],
+    message: str,
+    delivery_plan: Dict[str, Any],
+    session_id: str,
+    original_user_messages: Optional[List[str]] = None,
+    reply_to_message_id: Optional[int] = None,
+    agent_id: Optional[str] = None,
+) -> str:
+    """
+    Submit an AI reply for human-clock delivery: enqueue to active (immediate) or delayed (night) queue.
+    Use this instead of send_message/reply_to_message when the AI-service provides a delivery_plan.
+    delivery_plan: { mode: "immediate"|"scheduled", delay_seconds: float|null, oof_message: str|null, user_tz: str, batch_key: str }.
+    """
+    global _active_queue, _delayed_heap, _delayed_counter
+    if _active_queue is None:
+        _active_queue = asyncio.Queue()
+    now_utc = datetime.now(timezone.utc)
+    plan = delivery_plan or {}
+    mode = plan.get("mode") or "immediate"
+    user_tz = plan.get("user_tz") or "UTC"
+    batch_key = plan.get("batch_key") or f"telegram:{session_id}"
+    orig_msgs = list(original_user_messages or [])
+
+    def make_qm(llm_text: str, eta_utc: datetime) -> QueuedMessage:
+        return QueuedMessage(
+            chat_id=chat_id,
+            session_id=session_id,
+            llm_reply=llm_text,
+            user_tz=user_tz,
+            batch_key=batch_key,
+            created_at=now_utc.isoformat(),
+            planned_eta_utc=eta_utc.isoformat(),
+            original_user_messages=orig_msgs,
+            reply_to_message_id=reply_to_message_id,
+            agent_id=agent_id,
+        )
+
+    if mode == "scheduled":
+        delay_sec = plan.get("delay_seconds") or 0
+        eta_utc = now_utc + timedelta(seconds=float(delay_sec))
+        qm = make_qm(message, eta_utc)
+        _delayed_counter += 1
+        async with _delayed_heap_lock:
+            heapq.heappush(_delayed_heap, (eta_utc, _delayed_counter, qm))
+            _persist_delayed_heap()
+        oof = (plan.get("oof_message") or "").strip()
+        if oof:
+            oof_qm = make_qm(oof, now_utc)
+            await _active_queue.put(oof_qm)
+        return f"Queued for delivery at {eta_utc.isoformat()} (scheduled)."
+    # immediate
+    qm = make_qm(message, now_utc)
+    await _active_queue.put(qm)
+    oof = (plan.get("oof_message") or "").strip()
+    if oof:
+        oof_qm = make_qm(oof, now_utc)
+        await _active_queue.put(oof_qm)
+    return "Queued for immediate delivery."
+
+
+@mcp.tool(
     annotations=ToolAnnotations(title="Reply To Message", openWorldHint=True, destructiveHint=True)
 )
 @validate_id("chat_id")
@@ -4265,6 +4603,7 @@ class _TelethonLifespan:
                     await client.start()
                     print("Telegram client started successfully")
                     _connected = True
+                    start_delivery_background_tasks()
                 except Exception as e:
                     print(f"Error starting Telegram client: {e}", file=sys.stderr)
                     if isinstance(e, sqlite3.OperationalError) and "database is locked" in str(e):
@@ -4276,8 +4615,19 @@ class _TelethonLifespan:
             return msg
 
         async def _send(msg):
-            # Disconnect Telethon just before signalling shutdown complete
+            # Disconnect Telethon and cancel delivery tasks before signalling shutdown complete
             if msg["type"] == "lifespan.shutdown.complete" and _connected:
+                try:
+                    for task in (_delivery_worker_task, _scheduler_task):
+                        if task and not task.done():
+                            task.cancel()
+                            try:
+                                await task
+                            except asyncio.CancelledError:
+                                pass
+                    print("Delivery tasks stopped")
+                except Exception as e:
+                    print(f"Error stopping delivery tasks: {e}", file=sys.stderr)
                 try:
                     print("Disconnecting Telegram client...")
                     await client.disconnect()
@@ -4299,6 +4649,7 @@ async def _main() -> None:
         # Start the Telethon client non-interactively
         print("Starting Telegram client (stdio mode)...")
         await client.start()
+        start_delivery_background_tasks()
 
         print("Telegram client started. Running MCP server...")
         # Use the asynchronous entrypoint instead of mcp.run()

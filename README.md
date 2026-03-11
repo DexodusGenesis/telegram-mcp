@@ -70,6 +70,7 @@ This MCP server exposes a huge suite of Telegram tools. **Every major Telegram/T
 - **pin_message(chat_id, message_id)**: Pin a message
 - **unpin_message(chat_id, message_id)**: Unpin a message
 - **mark_as_read(chat_id)**: Mark all as read
+- **submit_telegram_reply(chat_id, message, delivery_plan, session_id, ...)**: Submit an AI reply for human-clock delivery (anti-ban). Use instead of `send_message`/`reply_to_message` when the AI service provides a `delivery_plan` (immediate vs scheduled/night). Requires telegram-mcp to run as a **long-lived process** (e.g. HTTP mode or systemd) so the delivery worker and scheduler stay alive.
 - **get_message_context(chat_id, message_id, context_size)**: Context around a message
 - **get_history(chat_id, limit)**: Full chat history
 - **get_pinned_messages(chat_id)**: List pinned messages
